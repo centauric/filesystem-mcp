@@ -72,6 +72,13 @@ func (tm *ToolsManager) AddTools() {
 		),
 		mcp.WithArray("ranges",
 			mcp.Description("Array of {offset, limit} objects for partial reads. offset is 0-based line number, limit is number of lines"),
+			mcp.Items(map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"offset": map[string]any{"type": "number", "description": "0-based line number to start reading from"},
+					"limit":  map[string]any{"type": "number", "description": "Number of lines to read"},
+				},
+			}),
 		),
 	), tm.HandleReadFile)
 
@@ -98,6 +105,15 @@ func (tm *ToolsManager) AddTools() {
 		mcp.WithArray("edits",
 			mcp.Required(),
 			mcp.Description("Array of {old_text, new_text, replace_all} objects. old_text must match exactly. new_text is the replacement. replace_all (optional, default false) replaces all occurrences"),
+			mcp.Items(map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"old_text":    map[string]any{"type": "string", "description": "Exact text to find in the file"},
+					"new_text":    map[string]any{"type": "string", "description": "Replacement text"},
+					"replace_all": map[string]any{"type": "boolean", "description": "Replace all occurrences (default: false)"},
+				},
+				"required": []any{"old_text", "new_text"},
+			}),
 		),
 	), tm.HandleEditFile)
 
