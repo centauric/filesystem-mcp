@@ -2,9 +2,14 @@
 
 新建一个高频定时任务 Worker 时，参照以下规范。
 
+**共享运行时包：**
+- `cf-worker-runtime`（`@cf-workers/runtime`）：所有 Worker 共用的运行时基础设施——错误提取、HTTP 代理/断路器、Pushover 通知、Secrets 解析。新项目必须使用此包，不要重复实现。
+
 **参考项目：**
-- `pendle-market-making`：完整的 DO + Alarm 链、http.ts、WorkerEnv/Env 双类型、extractErrorMessage
-- `pendle-order-watch`：Pushover 通知、Effect.gen 业务逻辑、多市场 wrangler 部署
+- `hl-boros-spread`：已迁移到 `@cf-workers/runtime`，完整的 DO + Alarm 链、Effect.gen 业务逻辑
+- `univ4-autoexit-arb`：已迁移到 `@cf-workers/runtime`，Context/Layer DI、多市场 wrangler 部署
+- `pendle-market-making`：完整的 DO + Alarm 链
+- `pendle-order-watch`：Pushover 通知、多市场 wrangler 部署
 
 ---
 
@@ -14,6 +19,7 @@
 - **语言**：TypeScript（strict mode）
 - **包管理 / 测试**：Bun（`bun install`、`bun test`）
 - **核心库**：Effect（必须深度使用，见下文）、viem、decimal.js
+- **共享运行时**：`@cf-workers/runtime`（`"file:../cf-worker-runtime"`）——错误提取、HTTP 代理、Pushover、Secrets 解析
 - **部署**：Wrangler
 
 ---
@@ -106,7 +112,7 @@ export class SchedulerDO implements DurableObject {
         return;
       }
 
-      const env = await resolveSecrets(this.env);
+      const env = await resolveEnvSecrets(this.env);
 
       // runTick 是 Effect 程序，通过 Effect.runPromise 桥接到 async
       const result = await Effect.runPromise(
@@ -199,21 +205,24 @@ export class SchedulerDO implements DurableObject {
 
 #### 错误类型定义：使用 `Data.TaggedError`
 
-优先使用 `Data.TaggedError` 定义 typed error，不要用裸 `class X extends Error`：
+优先使用 `Data.TaggedError` 定义 typed error，不要用裸 `class X extends Error`。
+
+**通用错误类型来自 `@cf-workers/runtime`**，不要重复定义：
+- `D1QueryError` — D1 查询错误（带 `query` 字段）
+- `D1WriteError` — D1 写入错误（带 `table` 字段）
+- `RelayError` — 所有 relay 均失败时抛出
+- `NotificationError` — Pushover 通知失败
 
 ```ts
+// ✅ 从共享包导入通用错误
+import { D1QueryError, NotificationError } from "@cf-workers/runtime";
+
+// ✅ 业务专属错误在项目本地定义
 import { Data } from "effect";
 
-// ✅ 正确：Data.TaggedError，自带 readonly _tag，与 Effect.catchTag 无缝配合
 export class FetchOrderbookError extends Data.TaggedError("FetchOrderbookError")<{
   readonly message: string;
   readonly cause?: unknown;
-}> {}
-
-export class D1QueryError extends Data.TaggedError("D1QueryError")<{
-  readonly message: string;
-  readonly cause?: unknown;
-  readonly query?: string;
 }> {}
 ```
 
@@ -297,14 +306,14 @@ const watchTask = (env: Env): Effect.Effect<void> =>
     }
 
     yield* executeAction(env, data);
-    yield* sendPushover(env, `Action completed for ${data.id}`).pipe(
+    yield* pushover.sendMessage({ message: `Action completed for ${data.id}` }).pipe(
       // 成功通知失败不影响业务结果
       Effect.catchAll((err) => Console.error(`notification failed: ${toErrorMessage(err)}`)),
     );
   }).pipe(
     // ✅ 正确：tapError 发通知后错误继续传播，alarm 层能捕获并记录 lastError
     Effect.tapError((error) =>
-      sendPushover(env, `Task failed: ${toErrorMessage(error)}`).pipe(
+      pushover.sendMessage({ message: `Task failed: ${toErrorMessage(error)}` }).pipe(
         Effect.catchAll((pushoverError) =>
           Console.error(`Failed to send error notification: ${toErrorMessage(pushoverError)}`),
         ),
@@ -443,7 +452,15 @@ const result = await Effect.runPromise(
 
 ### 5. HTTP 代理层
 
-上层代码统一调用 `fetchFn(url, init?)`，不关心底层是直连还是代理。代理切换由 `createSmartFetch` 自动管理。
+上层代码统一调用 `fetchFn(url, init?)`，不关心底层是直连还是代理。代理切换由 `@cf-workers/runtime` 的 `createSmartFetch` 自动管理。
+
+```ts
+import { createSmartFetch, createStorageRelayLock } from "@cf-workers/runtime";
+
+// 在 DO 中创建
+const relayLock = createStorageRelayLock(this.ctx.storage);
+const fetchFn = createSmartFetch(env.HTTPPROXYCONFIG, env.RELAY_API_KEY, relayLock, fetch);
+```
 
 #### 代理选择策略：直连优先，失败自动切代理（永久锁定）
 
@@ -485,13 +502,16 @@ function shouldFallbackToRelay(response: Response): boolean {
 
 #### RelayLock 接口
 
-锁定状态通过 `RelayLock` 接口抽象，由 DO 端使用 `ctx.storage` 实现：
+锁定状态通过 `@cf-workers/runtime` 的 `RelayLock` 接口抽象：
 
 ```ts
-export interface RelayLock {
-  isLocked(host: string): Promise<boolean>;  // 检查 host 是否已锁定走代理
-  lock(host: string): Promise<void>;         // 永久锁定该 host 走代理
-}
+import { createStorageRelayLock, createInMemoryRelayLock } from "@cf-workers/runtime";
+
+// DO 中使用持久化锁（跨 DO 驱逐存活）
+const relayLock = createStorageRelayLock(this.ctx.storage);
+
+// 非 DO 环境使用内存锁
+const relayLock = createInMemoryRelayLock();
 ```
 
 DO storage key 约定：
@@ -499,10 +519,12 @@ DO storage key 约定：
 
 #### 实现要点
 
+以下均由 `@cf-workers/runtime` 提供，不需要在项目中实现：
+
 - `createSmartFetch(config, relayApiKey, relayLock, baseFetch)` — 接收 KV（代理 URL）、API key、RelayLock、可选 baseFetch
-- `fetchViaRelay()` — 通过单个代理发送请求，携带 `X-Api-Key` header
-- `fetchViaRelayChain()` — 依次尝试所有代理，某个失败后自动尝试下一个，全部失败抛出最后一个错误
-- `SchedulerDO` 构造函数中创建 `createStorageRelayLock(ctx.storage)` 并通过 `buildLiveRuntimeLayer` 传入
+- `createStorageRelayLock(storage)` — 基于 DO storage 的持久化锁
+- `createInMemoryRelayLock()` — 基于 Set 的内存锁
+- 全部 relay 失败时抛出 `RelayError`（`Data.TaggedError`）
 
 #### 调用约束
 
@@ -563,166 +585,97 @@ secret_name = "ETH_NODE_URL"
 
 #### WorkerEnv → Env 双类型模式
 
-`WorkerEnv` 是 Wrangler 注入的原始环境，secret 字段类型为 `SecretsStoreSecret`（handle，需要异步 `.get()` 才能获取值）。`Env` 是 resolved 后的环境，secret 字段类型为 `string`，供业务逻辑直接使用。
+`WorkerEnv` 是 Wrangler 注入的原始环境，secret 字段类型为 `SecretLike`（handle，需要异步 `.get()` 才能获取值）。`Env` 是 resolved 后的环境，secret 字段类型为 `string`，供业务逻辑直接使用。
+
+使用 `@cf-workers/runtime` 的泛型 `resolveSecrets`，自动推导返回类型，不需要手动定义 `Env` 接口：
 
 ```ts
-/** Worker binding env — secrets 是 SecretsStoreSecret handle */
+import { resolveSecrets, type SecretLike } from "@cf-workers/runtime";
+
+/** Worker binding env — secrets 是 SecretLike handle */
 export interface WorkerEnv {
   SCHEDULER: DurableObjectNamespace;
   HTTPPROXYCONFIG: KVNamespace;
-  SECRET_KEY: SecretsStoreSecret;
-  ETH_NODE_URL: SecretsStoreSecret;
-  PUSHOVER_TOKEN: SecretsStoreSecret;
-  PUSHOVER_USER: SecretsStoreSecret;
+  SECRET_KEY: SecretLike;
+  ETH_NODE_URL: SecretLike;
+  PUSHOVER_TOKEN: SecretLike;
+  PUSHOVER_USER: SecretLike;
   // [vars] 中的值直接是 string
   MARKET_ADDRESS: string;
   CHAIN_ID: string;
 }
 
-/** Env with secrets resolved to plain strings — 业务逻辑使用这个 */
-export interface Env {
-  SCHEDULER: DurableObjectNamespace;
-  HTTPPROXYCONFIG: KVNamespace;
-  SECRET_KEY: string;
-  ETH_NODE_URL: string;
-  PUSHOVER_TOKEN: string;
-  PUSHOVER_USER: string;
-  MARKET_ADDRESS: string;
-  CHAIN_ID: string;
+/** Env with secrets resolved — 由 resolveSecrets 自动推导 */
+export type Env = Awaited<ReturnType<typeof resolveEnvSecrets>>;
+
+export function resolveEnvSecrets(env: WorkerEnv) {
+  return resolveSecrets(env, [
+    "SECRET_KEY",
+    "ETH_NODE_URL",
+    "PUSHOVER_TOKEN",
+    "PUSHOVER_USER",
+  ] as const);
 }
 ```
 
-#### resolveSecrets()
-
-用 `Promise.all()` 并行解析所有 secret，返回 resolved 的 `Env`。在 DO `alarm()` 开头调用一次，向下传递：
-
-```ts
-export async function resolveSecrets(env: WorkerEnv): Promise<Env> {
-  const [secretKey, ethNodeUrl, pushoverToken, pushoverUser] = await Promise.all([
-    env.SECRET_KEY.get(),
-    env.ETH_NODE_URL.get(),
-    env.PUSHOVER_TOKEN.get(),
-    env.PUSHOVER_USER.get(),
-  ]);
-  return {
-    ...env,
-    SECRET_KEY: secretKey,
-    ETH_NODE_URL: ethNodeUrl,
-    PUSHOVER_TOKEN: pushoverToken,
-    PUSHOVER_USER: pushoverUser,
-  };
-}
-```
+**泛型约束：** `resolveSecrets` 的第二个参数只接受 `WorkerEnv` 中类型为 `SecretLike` 的键。传入非 secret 键（如 `MARKET_ADDRESS`）会产生编译错误，而不是运行时错误。
 
 **要点：**
-- `resolveSecrets` 无内部 try/catch——任意 secret 解析失败会导致 `Promise.all` reject，异常传播到 `alarm()` 的 catch 块记录 `lastError`，整个 tick 跳过。下一个 alarm 会自动重试，这是预期行为
-- 可选 secret 用 `env.OPTIONAL_SECRET?.get() ?? Promise.resolve(undefined)` 处理
-- 每个 tick 只调用一次 `resolveSecrets()`，不要在业务逻辑中重复调用
+- `resolveSecrets` 无内部 try/catch——任意 secret 解析失败会导致 reject，异常传播到 `alarm()` 的 catch 块记录 `lastError`，整个 tick 跳过。下一个 alarm 会自动重试，这是预期行为
+- 每个 tick 只调用一次 `resolveEnvSecrets()`，不要在业务逻辑中重复调用
+- `SecretLike` 类型结构上兼容 `SecretsStoreSecret`，不需要显式 cast
 
 ### 8. 错误信息提取
 
-使用 `extractErrorMessage` 递归提取嵌套错误信息。Effect 库内部的错误结构会通过 `cause`/`error`/`failure`/`left`/`right` 等键嵌套，需要递归遍历才能拿到真正的错误消息。
-
-完整参考实现：
+使用 `@cf-workers/runtime` 的 `extractErrorMessage` 递归提取嵌套错误信息。Effect 库内部的错误结构会通过 `cause`/`error`/`failure`/`left`/`right` 等键嵌套，需要递归遍历才能拿到真正的错误消息。
 
 ```ts
-function extractErrorMessage(error: unknown): string {
-  const visited = new Set<object>();
+import { extractErrorMessage, toErrorMessage } from "@cf-workers/runtime";
 
-  const visit = (value: unknown): string | undefined => {
-    if (typeof value === "object" && value !== null) {
-      if (visited.has(value)) return undefined;
-      visited.add(value);
+// extractErrorMessage — 递归遍历 Effect 错误链，处理循环引用
+const msg = extractErrorMessage(error);
 
-      const record = value as Record<PropertyKey, unknown>;
-
-      // 递归遍历 Effect 错误链的标准键
-      for (const key of ["cause", "error", "failure", "left", "right"]) {
-        const nested = visit(record[key]);
-        if (nested) return nested;
-      }
-
-      // 遍历 Symbol 键（Effect 内部使用）
-      for (const symbol of Object.getOwnPropertySymbols(value)) {
-        const nested = visit(record[symbol]);
-        if (nested) return nested;
-      }
-
-      if (typeof record.message === "string" && record.message.length > 0) {
-        return record.message;
-      }
-    }
-    return undefined;
-  };
-
-  return visit(error) ?? String(error);
-}
+// toErrorMessage — 简化版，先检查 instanceof Error
+const msg = toErrorMessage(error);
 ```
 
-简化版（适用于 Effect 已处理错误上下文的场景）：
-
-```ts
-const toErrorMessage = (error: unknown): string =>
-  error instanceof Error ? error.message : String(error);
-```
+不要在项目中重新实现这些函数。
 
 ### 9. Pushover 通知
 
-所有 Worker 使用 Pushover 发送运行时通知。标准实现如下：
+所有 Worker 使用 `@cf-workers/runtime` 的 `createPushoverService` 发送运行时通知。工厂函数在创建时部分应用 credentials，调用时只需传消息内容：
 
 ```ts
-export class PushoverError extends Data.TaggedError("PushoverError")<{
-  readonly message: string;
-  readonly cause?: unknown;
-}> {}
+import { createPushoverService } from "@cf-workers/runtime";
 
-const sendPushover = (env: Env, message: string, priority: string = "1") =>
-  Effect.tryPromise({
-    try: async () => {
-      const pushoverUrl = "https://api.pushover.net/1/messages.json";
-      console.log(`[pushover] POST message_length=${message.length}`);
-      const start = Date.now();
-      const response = await fetch(pushoverUrl, {
-        method: "POST",
-        signal: AbortSignal.timeout(10_000),
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({
-          token: env.PUSHOVER_TOKEN,
-          user: env.PUSHOVER_USER,
-          message,
-          priority,
-        }),
-      });
-      const elapsed = Date.now() - start;
-      console.log(`[pushover] ${response.status} in ${elapsed}ms`);
-      if (!response.ok) {
-        throw new Error(`Pushover request failed with ${response.status}`);
-      }
-    },
-    catch: (error) =>
-      new PushoverError({
-        message: `Failed to send Pushover notification: ${toErrorMessage(error)}`,
-        cause: error,
-      }),
-  });
+// 在 DO alarm() 中创建（resolveSecrets 之后）
+const pushover = createPushoverService(
+  { token: env.PUSHOVER_TOKEN, user: env.PUSHOVER_USER },
+  fetch,  // 可选，默认用全局 fetch
+);
+
+// 发送通知
+yield* pushover.sendMessage({ message: "Task completed" });
+yield* pushover.sendMessage({ message: "Alert!", priority: "1" });
 ```
 
 **要点：**
 - Pushover 不走代理，直接用 `fetch`
-- 使用 `AbortSignal.timeout` 设置超时，避免通知卡住整个 tick
+- 内置 `AbortSignal.timeout(10_000)` 超时保护
+- 失败时抛出 `NotificationError`（`Data.TaggedError`）
 - credentials 通过 Secrets Store 管理：`PUSHOVER_TOKEN`、`PUSHOVER_USER`
 - 通知的错误处理取决于调用场景：
 
 ```ts
 // 成功通知：发送失败不影响业务结果，用 catchAll 降级
-yield* sendPushover(env, successMessage).pipe(
+yield* pushover.sendMessage({ message: successMessage }).pipe(
   Effect.catchAll((err) => Console.error(`notification failed: ${toErrorMessage(err)}`)),
 );
 
 // 失败通知：用 tapError 旁路发送，不吞掉原始业务错误
 const businessLogic = mainTask.pipe(
   Effect.tapError((error) =>
-    sendPushover(env, `Task failed: ${toErrorMessage(error)}`).pipe(
+    pushover.sendMessage({ message: `Task failed: ${toErrorMessage(error)}` }).pipe(
       Effect.catchAll((err) => Console.error(`error notification failed: ${toErrorMessage(err)}`)),
     ),
   ),
