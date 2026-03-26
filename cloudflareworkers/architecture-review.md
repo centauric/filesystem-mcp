@@ -6,8 +6,8 @@
 - `cf-worker-runtime`（`@cf-workers/runtime`）：所有 Worker 共用的运行时基础设施——错误提取、HTTP 代理/断路器、Pushover 通知、Secrets 解析。新项目必须使用此包，不要重复实现。
 
 **参考项目：**
-- `hl-boros-spread`：已迁移到 `@cf-workers/runtime`，完整的 DO + Alarm 链、Effect.gen 业务逻辑
-- `univ4-autoexit-arb`：已迁移到 `@cf-workers/runtime`，Context/Layer DI、多市场 wrangler 部署
+- `hl-boros-spread`：完整的 DO + Alarm 链、Effect.gen 业务逻辑
+- `univ4-autoexit-arb`：Context/Layer DI、多市场 wrangler 部署
 - `pendle-market-making`：完整的 DO + Alarm 链
 - `pendle-order-watch`：Pushover 通知、多市场 wrangler 部署
 
